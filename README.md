@@ -5,11 +5,15 @@ Einfache Win32-GUI-Anwendung in D (nur `core.sys.windows`, keine externen Biblio
 - **Fenster** mit einer Liste (ListView) aller Dateien und Verzeichnisse im
   TMP-Verzeichnis (`GetTempPathW`), die zuletzt **vor der letzten Mitternacht**
   (00:00 Uhr heute, lokale Zeit) geändert wurden – Spalten: Name, Typ, Datum, Größe.
-  Darüber eine Info-Zeile mit Begrüßung und Anzahl der Einträge.
-- **Menü**: *Datei → Name eingeben… (Strg+N) / Aktualisieren (F5) / Beenden*, *Hilfe → Über…*
-- **Dialog**: modaler Dialog mit Textfeld, OK und Abbrechen. Das Dialog-Template
-  wird zur Laufzeit im Speicher erzeugt (`DialogBoxIndirectParamW`), daher wird
-  kein Ressourcen-Compiler benötigt.
+- **Suche** (Strg+F): filtert die Liste beim Tippen nach Namen
+  (Teilstring, Groß-/Kleinschreibung egal).
+- **Alle markieren** (Button oder Strg+A): markiert alle angezeigten Einträge.
+  Einzelne Einträge lassen sich wie gewohnt mit Strg/Umschalt + Klick markieren.
+- **In den Papierkorb** (Button, Entf oder Menü): verschiebt die markierten Einträge
+  per `SHFileOperationW` mit `FOF_ALLOWUNDO` in den Papierkorb; Windows fragt vorher nach.
+- Eine Info-Zeile zeigt angezeigte/gesamte/markierte Einträge, das TMP-Verzeichnis und den Stichtag.
+- **Menü**: *Datei → Suchen / Aktualisieren (F5) / Beenden*,
+  *Bearbeiten → Alle markieren / In den Papierkorb*, *Hilfe → Über…*
 
 ## Bauen und Starten (Windows)
 

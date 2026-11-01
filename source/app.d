@@ -1,13 +1,11 @@
 /**
  * Einfache Win32-GUI-Anwendung in D.
  *
- * - Hauptfenster mit Menü (Datei / Hilfe)
+ * - Hauptfenster mit Menü (Datei / Bearbeiten / Hilfe)
  * - Liste aller Dateien und Verzeichnisse im TMP-Verzeichnis, die zuletzt
  *   vor der letzten Mitternacht (lokale Zeit) geändert wurden
- * - Modaler Dialog zur Eingabe eines Namens
- *
- * Der Dialog wird zur Laufzeit als DLGTEMPLATE im Speicher aufgebaut,
- * daher ist kein Ressourcen-Compiler (rc.exe) notwendig.
+ * - Suche nach dem Namen (Filter, Groß-/Kleinschreibung egal)
+ * - Alle markieren und markierte Einträge in den Papierkorb verschieben
  */
 module app;
 
@@ -15,8 +13,11 @@ version (Windows) {} else static assert(0, "Diese Anwendung läuft nur unter Win
 
 import core.sys.windows.windows;
 import core.sys.windows.commctrl;
+import core.sys.windows.shellapi;
+import std.algorithm.searching : canFind;
 import std.algorithm.sorting : sort;
 import std.format : format;
+import std.uni : toLower;
 import std.utf : toUTF16, toUTF16z;
 
 /*
@@ -30,47 +31,75 @@ pragma(linkerDirective,
     "version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"");
 
 // ---------------------------------------------------------------------------
-// IDs
+// IDs und Konstanten
 // ---------------------------------------------------------------------------
 
 enum : UINT
 {
-    IDM_FILE_NAME  = 1001,
-    IDM_FILE_EXIT  = 1002,
-    IDM_HELP_ABOUT = 1003,
-    IDM_FILE_REFRESH = 1004,
+    IDM_FILE_FIND     = 1001,
+    IDM_FILE_REFRESH  = 1002,
+    IDM_FILE_EXIT     = 1003,
+    IDM_EDIT_SELALL   = 1004,
+    IDM_EDIT_RECYCLE  = 1005,
+    IDM_HELP_ABOUT    = 1006,
 }
 
 enum : UINT
 {
-    IDC_INFO_LABEL = 3001,
-    IDC_FILE_LIST  = 3002,
+    IDC_SEARCH_LABEL  = 3001,
+    IDC_SEARCH_EDIT   = 3002,
+    IDC_SELALL_BUTTON = 3003,
+    IDC_RECYCLE_BUTTON = 3004,
+    IDC_INFO_LABEL    = 3005,
+    IDC_FILE_LIST     = 3006,
 }
 
-enum infoHeight = 28; // Höhe der Info-Zeile über der Liste in Pixeln
+/// Eigene Nachricht: Info-Zeile und Buttons aktualisieren (gebündelt).
+enum UINT WM_APP_UPDATE_STATUS = WM_APP + 1;
 
-enum : WORD
-{
-    IDC_NAME_EDIT  = 2001,
-    IDC_NAME_LABEL = 2002,
-}
+enum UINT EM_SETCUEBANNER_       = 0x1501;  // ECM_FIRST + 1
+enum WORD FOF_WANTNUKEWARNING_   = 0x4000;
+
+// Layout (Pixel)
+enum margin       = 8;
+enum rowHeight    = 24;
+enum buttonWidth  = 130;
+enum labelWidth   = 45;
+enum listTop      = margin + rowHeight + 6 + 20 + 6;
 
 immutable wstring windowClassName = "Win32DTestMainWindow"w;
 
-/// Aktueller Name, der im Hauptfenster angezeigt wird.
-__gshared wstring g_name = "Welt"w;
+// ---------------------------------------------------------------------------
+// Globaler Zustand
+// ---------------------------------------------------------------------------
 
-/// Instanz-Handle der Anwendung.
+/// Ein Eintrag im TMP-Verzeichnis.
+struct TmpEntry
+{
+    wstring name;
+    wstring lowerName; // für die Suche
+    bool isDirectory;
+    FILETIME lastWrite; // UTC
+    ulong size;
+}
+
 __gshared HINSTANCE g_hInstance;
-
-/// Steuerelemente im Hauptfenster.
+__gshared HWND g_mainWindow;
+__gshared HWND g_searchLabel;
+__gshared HWND g_searchEdit;
+__gshared HWND g_selAllButton;
+__gshared HWND g_recycleButton;
 __gshared HWND g_infoLabel;
 __gshared HWND g_fileList;
 
-/// Anzahl und Verzeichnis der zuletzt gelisteten Einträge (für die Info-Zeile).
-__gshared size_t g_entryCount;
+/// Alle gefundenen Einträge (vor Mitternacht geändert).
+__gshared TmpEntry[] g_entries;
+/// Indizes in g_entries, die aktuell angezeigt werden (Zeile -> Eintrag).
+__gshared size_t[] g_view;
+
 __gshared wstring g_tmpDir;
 __gshared wstring g_cutoffText;
+__gshared bool g_statusUpdatePending;
 
 // ---------------------------------------------------------------------------
 // Einstiegspunkt
@@ -121,11 +150,11 @@ int runApp(HINSTANCE hInstance, int nCmdShow)
     }
 
     HWND hwnd = CreateWindowExW(
-        0,
+        WS_EX_CONTROLPARENT,
         windowClassName.ptr,
         "Win32 D Testanwendung"w.ptr,
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 800, 500,
+        CW_USEDEFAULT, CW_USEDEFAULT, 820, 520,
         null,
         createMainMenu(),
         hInstance,
@@ -141,10 +170,11 @@ int runApp(HINSTANCE hInstance, int nCmdShow)
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    // Tastenkürzel: Strg+N (Name), F5 (Aktualisieren)
-    ACCEL[2] accels = [
-        ACCEL(FVIRTKEY | FCONTROL, 'N', cast(WORD) IDM_FILE_NAME),
+    // Tastenkürzel: Strg+F (Suche), F5 (Aktualisieren), Strg+A (Alle markieren)
+    ACCEL[3] accels = [
+        ACCEL(FVIRTKEY | FCONTROL, 'F', cast(WORD) IDM_FILE_FIND),
         ACCEL(FVIRTKEY, VK_F5, cast(WORD) IDM_FILE_REFRESH),
+        ACCEL(FVIRTKEY | FCONTROL, 'A', cast(WORD) IDM_EDIT_SELALL),
     ];
     HACCEL hAccel = CreateAcceleratorTableW(accels.ptr, cast(int) accels.length);
     scope (exit) DestroyAcceleratorTable(hAccel);
@@ -153,6 +183,8 @@ int runApp(HINSTANCE hInstance, int nCmdShow)
     while (GetMessageW(&msg, null, 0, 0) > 0)
     {
         if (TranslateAcceleratorW(hwnd, hAccel, &msg))
+            continue;
+        if (IsDialogMessageW(hwnd, &msg)) // Tab-Navigation zwischen den Steuerelementen
             continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
@@ -167,16 +199,21 @@ int runApp(HINSTANCE hInstance, int nCmdShow)
 HMENU createMainMenu()
 {
     HMENU fileMenu = CreatePopupMenu();
-    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_NAME, "&Name eingeben...\tStrg+N"w.ptr);
+    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_FIND, "&Suchen\tStrg+F"w.ptr);
     AppendMenuW(fileMenu, MF_STRING, IDM_FILE_REFRESH, "&Aktualisieren\tF5"w.ptr);
     AppendMenuW(fileMenu, MF_SEPARATOR, 0, null);
     AppendMenuW(fileMenu, MF_STRING, IDM_FILE_EXIT, "&Beenden"w.ptr);
+
+    HMENU editMenu = CreatePopupMenu();
+    AppendMenuW(editMenu, MF_STRING, IDM_EDIT_SELALL, "&Alle markieren\tStrg+A"w.ptr);
+    AppendMenuW(editMenu, MF_STRING, IDM_EDIT_RECYCLE, "In den &Papierkorb\tEntf"w.ptr);
 
     HMENU helpMenu = CreatePopupMenu();
     AppendMenuW(helpMenu, MF_STRING, IDM_HELP_ABOUT, "Ü&ber..."w.ptr);
 
     HMENU menuBar = CreateMenu();
     AppendMenuW(menuBar, MF_POPUP, cast(UINT_PTR) fileMenu, "&Datei"w.ptr);
+    AppendMenuW(menuBar, MF_POPUP, cast(UINT_PTR) editMenu, "&Bearbeiten"w.ptr);
     AppendMenuW(menuBar, MF_POPUP, cast(UINT_PTR) helpMenu, "&Hilfe"w.ptr);
     return menuBar;
 }
@@ -190,11 +227,21 @@ LRESULT mainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) nothrow
 {
     switch (msg)
     {
+        case WM_CREATE:
+            g_mainWindow = hwnd;
+            createChildControls(hwnd);
+            refreshFileList();
+            return 0;
+
         case WM_COMMAND:
-            switch (cast(UINT) LOWORD(cast(DWORD) wParam))
+        {
+            UINT id   = LOWORD(cast(DWORD) wParam);
+            UINT code = HIWORD(cast(DWORD) wParam);
+            switch (id)
             {
-                case IDM_FILE_NAME:
-                    showNameDialog(hwnd);
+                case IDM_FILE_FIND:
+                    SetFocus(g_searchEdit);
+                    SendMessageW(g_searchEdit, EM_SETSEL, 0, -1);
                     return 0;
 
                 case IDM_FILE_REFRESH:
@@ -205,10 +252,34 @@ LRESULT mainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) nothrow
                     DestroyWindow(hwnd);
                     return 0;
 
+                case IDM_EDIT_SELALL:
+                    // Strg+A im Suchfeld markiert den Suchtext, sonst alle Listeneinträge
+                    if (GetFocus() == g_searchEdit)
+                        SendMessageW(g_searchEdit, EM_SETSEL, 0, -1);
+                    else
+                        selectAll();
+                    return 0;
+
+                case IDC_SELALL_BUTTON:
+                    selectAll();
+                    SetFocus(g_fileList);
+                    return 0;
+
+                case IDM_EDIT_RECYCLE:
+                case IDC_RECYCLE_BUTTON:
+                    moveSelectedToRecycleBin(hwnd);
+                    return 0;
+
+                case IDC_SEARCH_EDIT:
+                    if (code == EN_CHANGE)
+                        applyFilter();
+                    return 0;
+
                 case IDM_HELP_ABOUT:
                     MessageBoxW(hwnd,
-                        ("Win32 D Testanwendung\n\nEin einfaches Beispiel für Fenster, Menü und Dialog in D.\n"w ~
-                         "Listet Einträge im TMP-Verzeichnis, die vor Mitternacht geändert wurden.\0"w).ptr,
+                        ("Win32 D Testanwendung\n\n"w ~
+                         "Listet Einträge im TMP-Verzeichnis, die vor Mitternacht geändert wurden.\n"w ~
+                         "Suche nach Namen, Alle markieren, In den Papierkorb verschieben.\0"w).ptr,
                         "Über"w.ptr, MB_OK | MB_ICONINFORMATION);
                     return 0;
 
@@ -216,27 +287,42 @@ LRESULT mainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) nothrow
                     break;
             }
             break;
+        }
 
-        case WM_CREATE:
-            createChildControls(hwnd);
-            refreshFileList();
+        case WM_NOTIFY:
+        {
+            auto hdr = cast(NMHDR*) lParam;
+            if (hdr.hwndFrom == g_fileList)
+            {
+                if (hdr.code == LVN_ITEMCHANGED)
+                {
+                    scheduleStatusUpdate();
+                }
+                else if (hdr.code == LVN_KEYDOWN)
+                {
+                    auto kd = cast(NMLVKEYDOWN*) lParam;
+                    if (kd.wVKey == VK_DELETE)
+                        moveSelectedToRecycleBin(hwnd);
+                }
+            }
+            break;
+        }
+
+        case WM_APP_UPDATE_STATUS:
+            g_statusUpdatePending = false;
+            updateStatus();
             return 0;
 
         case WM_SIZE:
-        {
-            int w = LOWORD(cast(DWORD) lParam);
-            int h = HIWORD(cast(DWORD) lParam);
-            MoveWindow(g_infoLabel, 8, 6, w - 16, infoHeight - 8, TRUE);
-            MoveWindow(g_fileList, 0, infoHeight, w, h - infoHeight, TRUE);
+            layoutControls(LOWORD(cast(DWORD) lParam), HIWORD(cast(DWORD) lParam));
             return 0;
-        }
 
         case WM_SETFOCUS:
             SetFocus(g_fileList);
             return 0;
 
         case WM_CTLCOLORSTATIC:
-            // Info-Zeile mit dem gleichen Hintergrund wie das Fenster zeichnen
+            // Beschriftungen mit dem gleichen Hintergrund wie das Fenster zeichnen
             SetBkColor(cast(HDC) wParam, GetSysColor(COLOR_WINDOW));
             return cast(LRESULT) GetSysColorBrush(COLOR_WINDOW);
 
@@ -251,31 +337,41 @@ LRESULT mainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) nothrow
 }
 
 // ---------------------------------------------------------------------------
-// Dateiliste (TMP-Verzeichnis)
+// Steuerelemente
 // ---------------------------------------------------------------------------
 
-/// Ein Eintrag im TMP-Verzeichnis.
-struct TmpEntry
+HWND createControl(HWND parent, DWORD exStyle, wstring className, wstring text,
+                   DWORD style, UINT id) nothrow
 {
-    wstring name;
-    bool isDirectory;
-    FILETIME lastWrite; // UTC
-    ulong size;
+    wstring cls = className ~ "\0"w;
+    wstring txt = text ~ "\0"w;
+    HWND h = CreateWindowExW(exStyle, cls.ptr, txt.ptr, WS_CHILD | WS_VISIBLE | style,
+        0, 0, 0, 0, parent, cast(HMENU) cast(size_t) id, g_hInstance, null);
+    SendMessageW(h, WM_SETFONT, cast(WPARAM) GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    return h;
 }
 
 void createChildControls(HWND parent) nothrow
 {
-    HFONT font = cast(HFONT) GetStockObject(DEFAULT_GUI_FONT);
+    g_searchLabel = createControl(parent, 0, "STATIC"w, "Suche:"w,
+        SS_LEFT | SS_CENTERIMAGE, IDC_SEARCH_LABEL);
 
-    g_infoLabel = CreateWindowExW(0, "STATIC"w.ptr, ""w.ptr,
-        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
-        0, 0, 0, 0, parent, cast(HMENU) cast(size_t) IDC_INFO_LABEL, g_hInstance, null);
-    SendMessageW(g_infoLabel, WM_SETFONT, cast(WPARAM) font, TRUE);
+    g_searchEdit = createControl(parent, WS_EX_CLIENTEDGE, "EDIT"w, ""w,
+        WS_TABSTOP | ES_AUTOHSCROLL, IDC_SEARCH_EDIT);
+    SendMessageW(g_searchEdit, EM_SETCUEBANNER_, TRUE,
+                 cast(LPARAM) "Name enthält ..."w.ptr);
 
-    g_fileList = CreateWindowExW(WS_EX_CLIENTEDGE, "SysListView32"w.ptr, ""w.ptr,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS,
-        0, 0, 0, 0, parent, cast(HMENU) cast(size_t) IDC_FILE_LIST, g_hInstance, null);
-    SendMessageW(g_fileList, WM_SETFONT, cast(WPARAM) font, TRUE);
+    g_selAllButton = createControl(parent, 0, "BUTTON"w, "Alle &markieren"w,
+        WS_TABSTOP | BS_PUSHBUTTON, IDC_SELALL_BUTTON);
+
+    g_recycleButton = createControl(parent, 0, "BUTTON"w, "In den &Papierkorb"w,
+        WS_TABSTOP | BS_PUSHBUTTON, IDC_RECYCLE_BUTTON);
+
+    g_infoLabel = createControl(parent, 0, "STATIC"w, ""w,
+        SS_LEFT | SS_CENTERIMAGE, IDC_INFO_LABEL);
+
+    g_fileList = createControl(parent, WS_EX_CLIENTEDGE, "SysListView32"w, ""w,
+        WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS, IDC_FILE_LIST);
     SendMessageW(g_fileList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
                  LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
 
@@ -283,6 +379,30 @@ void createChildControls(HWND parent) nothrow
     addColumn(1, "Typ"w,                 90,  LVCFMT_LEFT);
     addColumn(2, "Zuletzt geändert"w,    140, LVCFMT_LEFT);
     addColumn(3, "Größe (Bytes)"w,       110, LVCFMT_RIGHT); // rechtsbündig
+}
+
+void layoutControls(int w, int h) nothrow
+{
+    int y = margin;
+    int x = margin;
+    MoveWindow(g_searchLabel, x, y, labelWidth, rowHeight, TRUE);
+    x += labelWidth;
+
+    int buttonsWidth = 2 * buttonWidth + 2 * 6;
+    int editWidth = w - x - margin - buttonsWidth - 6;
+    if (editWidth < 80)
+        editWidth = 80;
+    MoveWindow(g_searchEdit, x, y, editWidth, rowHeight, TRUE);
+    x += editWidth + 6;
+
+    MoveWindow(g_selAllButton, x, y, buttonWidth, rowHeight, TRUE);
+    x += buttonWidth + 6;
+    MoveWindow(g_recycleButton, x, y, buttonWidth, rowHeight, TRUE);
+
+    y += rowHeight + 6;
+    MoveWindow(g_infoLabel, margin, y, w - 2 * margin, 20, TRUE);
+
+    MoveWindow(g_fileList, 0, listTop, w, h - listTop, TRUE);
 }
 
 void addColumn(int index, wstring title, int width, int align_) nothrow
@@ -310,6 +430,10 @@ void setCell(int row, int column, wstring value) nothrow
     else
         SendMessageW(g_fileList, LVM_SETITEMTEXTW, cast(WPARAM) row, cast(LPARAM) &item);
 }
+
+// ---------------------------------------------------------------------------
+// TMP-Verzeichnis einlesen
+// ---------------------------------------------------------------------------
 
 /// Liefert das TMP-Verzeichnis (GetTempPathW wertet TMP, dann TEMP aus).
 wstring tempDirectory() nothrow
@@ -354,7 +478,7 @@ wstring formatFileTime(FILETIME utc)
 }
 
 /// Sucht alle Dateien und Verzeichnisse in `dir`, die vor `cutoff` geändert wurden.
-TmpEntry[] findEntriesBefore(wstring dir, FILETIME cutoff) nothrow
+TmpEntry[] findEntriesBefore(wstring dir, FILETIME cutoff)
 {
     TmpEntry[] result;
     wstring pattern = dir ~ "*\0"w;
@@ -378,6 +502,7 @@ TmpEntry[] findEntriesBefore(wstring dir, FILETIME cutoff) nothrow
         {
             TmpEntry e;
             e.name        = name;
+            e.lowerName   = toLower(name);
             e.isDirectory = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
             e.lastWrite   = fd.ftLastWriteTime;
             e.size        = (cast(ulong) fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
@@ -389,7 +514,7 @@ TmpEntry[] findEntriesBefore(wstring dir, FILETIME cutoff) nothrow
     return result;
 }
 
-/// Liest das TMP-Verzeichnis neu ein und füllt die Liste.
+/// Liest das TMP-Verzeichnis neu ein und zeigt die Einträge (gefiltert) an.
 void refreshFileList() nothrow
 {
     try
@@ -405,200 +530,175 @@ void refreshFileList() nothrow
         entries.sort!((a, b) => a.isDirectory != b.isDirectory
                                 ? a.isDirectory
                                 : toUlong(a.lastWrite) > toUlong(b.lastWrite));
-
-        SendMessageW(g_fileList, WM_SETREDRAW, FALSE, 0);
-        SendMessageW(g_fileList, LVM_DELETEALLITEMS, 0, 0);
-        foreach (i, ref e; entries)
-        {
-            int row = cast(int) i;
-            setCell(row, 0, e.name);
-            setCell(row, 1, e.isDirectory ? "Verzeichnis"w : "Datei"w);
-            setCell(row, 2, formatFileTime(e.lastWrite));
-            setCell(row, 3, e.isDirectory ? ""w : format("%d"w, e.size));
-        }
-        SendMessageW(g_fileList, WM_SETREDRAW, TRUE, 0);
-        InvalidateRect(g_fileList, null, TRUE);
-
-        g_entryCount = entries.length;
+        g_entries = entries;
     }
     catch (Exception e)
     {
-        g_entryCount = 0;
-        MessageBoxW(null, ("Fehler beim Lesen des TMP-Verzeichnisses:\n"w ~ e.msg.toUTF16 ~ "\0"w).ptr,
+        g_entries = null;
+        MessageBoxW(g_mainWindow,
+                    ("Fehler beim Lesen des TMP-Verzeichnisses:\n"w ~ e.msg.toUTF16 ~ "\0"w).ptr,
                     "Fehler"w.ptr, MB_OK | MB_ICONERROR);
     }
-    updateInfoLabel();
+    applyFilter();
 }
 
-void updateInfoLabel() nothrow
+// ---------------------------------------------------------------------------
+// Suche
+// ---------------------------------------------------------------------------
+
+/// Liefert den aktuellen Suchtext in Kleinbuchstaben.
+wstring currentSearchText() nothrow
 {
+    int len = GetWindowTextLengthW(g_searchEdit);
+    if (len <= 0)
+        return null;
+    auto buf = new wchar[len + 1];
+    len = GetWindowTextW(g_searchEdit, buf.ptr, len + 1);
+    try
+        return toLower(buf[0 .. len].idup);
+    catch (Exception)
+        return buf[0 .. len].idup;
+}
+
+/// Füllt die Liste mit allen Einträgen, deren Name den Suchtext enthält.
+void applyFilter() nothrow
+{
+    wstring needle = currentSearchText();
+
+    g_view = null;
+    foreach (i, ref e; g_entries)
+    {
+        bool match = true;
+        if (needle.length)
+        {
+            try
+                match = e.lowerName.canFind(needle);
+            catch (Exception)
+                match = false;
+        }
+        if (match)
+            g_view ~= i;
+    }
+
+    SendMessageW(g_fileList, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(g_fileList, LVM_DELETEALLITEMS, 0, 0);
+    foreach (row, idx; g_view)
+    {
+        auto e = &g_entries[idx];
+        int r = cast(int) row;
+        setCell(r, 0, e.name);
+        setCell(r, 1, e.isDirectory ? "Verzeichnis"w : "Datei"w);
+        try
+        {
+            setCell(r, 2, formatFileTime(e.lastWrite));
+            setCell(r, 3, e.isDirectory ? ""w : format("%d"w, e.size));
+        }
+        catch (Exception) {}
+    }
+    SendMessageW(g_fileList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_fileList, null, TRUE);
+
+    updateStatus();
+}
+
+// ---------------------------------------------------------------------------
+// Markieren und Papierkorb
+// ---------------------------------------------------------------------------
+
+/// Markiert (selektiert) alle angezeigten Einträge.
+void selectAll() nothrow
+{
+    LVITEMW item;
+    item.stateMask = LVIS_SELECTED;
+    item.state     = LVIS_SELECTED;
+    // Index -1: gilt für alle Einträge
+    SendMessageW(g_fileList, LVM_SETITEMSTATE, cast(WPARAM) -1, cast(LPARAM) &item);
+}
+
+/// Liefert die Indizes (in g_entries) aller markierten Zeilen.
+size_t[] selectedEntries() nothrow
+{
+    size_t[] result;
+    int row = -1;
+    for (;;)
+    {
+        row = cast(int) SendMessageW(g_fileList, LVM_GETNEXTITEM,
+                                     cast(WPARAM) row, LVNI_SELECTED);
+        if (row < 0)
+            break;
+        if (row < g_view.length)
+            result ~= g_view[row];
+    }
+    return result;
+}
+
+/// Verschiebt alle markierten Einträge in den Papierkorb.
+void moveSelectedToRecycleBin(HWND owner) nothrow
+{
+    auto selected = selectedEntries();
+    if (selected.length == 0)
+    {
+        MessageBoxW(owner, "Es sind keine Einträge markiert."w.ptr,
+                    "Papierkorb"w.ptr, MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    // pFrom: vollständige Pfade, jeweils mit \0 getrennt, am Ende doppelt \0
+    wstring from;
+    foreach (idx; selected)
+        from ~= g_tmpDir ~ g_entries[idx].name ~ "\0"w;
+    from ~= "\0"w;
+
+    SHFILEOPSTRUCTW op;
+    op.hwnd   = owner;
+    op.wFunc  = FO_DELETE;
+    op.pFrom  = from.ptr;
+    // FOF_ALLOWUNDO = Papierkorb statt endgültigem Löschen.
+    // Windows fragt selbst nach einer Bestätigung und warnt, falls ein
+    // Eintrag nicht in den Papierkorb verschoben werden kann.
+    op.fFlags = cast(WORD)(FOF_ALLOWUNDO | FOF_WANTNUKEWARNING_);
+
+    int rc = SHFileOperationW(&op);
+    if (rc != 0 && !op.fAnyOperationsAborted)
+    {
+        try
+        {
+            wstring text = format("Die Einträge konnten nicht in den Papierkorb verschoben werden (Fehler 0x%X).\0"w, rc);
+            MessageBoxW(owner, text.ptr, "Papierkorb"w.ptr, MB_OK | MB_ICONERROR);
+        }
+        catch (Exception) {}
+    }
+
+    refreshFileList();
+}
+
+// ---------------------------------------------------------------------------
+// Info-Zeile
+// ---------------------------------------------------------------------------
+
+/// Bündelt viele LVN_ITEMCHANGED-Nachrichten (z. B. bei "Alle markieren") zu einem Update.
+void scheduleStatusUpdate() nothrow
+{
+    if (!g_statusUpdatePending)
+    {
+        g_statusUpdatePending = true;
+        PostMessageW(g_mainWindow, WM_APP_UPDATE_STATUS, 0, 0);
+    }
+}
+
+void updateStatus() nothrow
+{
+    auto selCount = cast(size_t) SendMessageW(g_fileList, LVM_GETSELECTEDCOUNT, 0, 0);
+    EnableWindow(g_recycleButton, selCount > 0);
+
     try
     {
-        wstring text = format("Hallo, %s!   %d Einträge in %s, zuletzt geändert vor %s\0"w,
-                              g_name, g_entryCount, g_tmpDir, g_cutoffText);
+        wstring text = format("%d von %d Einträgen angezeigt, %d markiert  –  %s, zuletzt geändert vor %s\0"w,
+                              g_view.length, g_entries.length, selCount, g_tmpDir, g_cutoffText);
         SetWindowTextW(g_infoLabel, text.ptr);
     }
     catch (Exception)
     {
-        SetWindowTextW(g_infoLabel, "Hallo!"w.ptr);
+        SetWindowTextW(g_infoLabel, ""w.ptr);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Dialog
-// ---------------------------------------------------------------------------
-
-void showNameDialog(HWND owner) nothrow
-{
-    auto tmpl = buildNameDialogTemplate();
-    INT_PTR res = DialogBoxIndirectParamW(
-        g_hInstance,
-        cast(const(DLGTEMPLATE)*) tmpl.ptr,
-        owner,
-        &nameDlgProc,
-        0);
-
-    if (res == IDOK)
-        updateInfoLabel();
-}
-
-extern (Windows)
-INT_PTR nameDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) nothrow
-{
-    switch (msg)
-    {
-        case WM_INITDIALOG:
-        {
-            HWND edit = GetDlgItem(hDlg, IDC_NAME_EDIT);
-            wstring current = g_name ~ "\0"w;
-            SetWindowTextW(edit, current.ptr);
-            SendMessageW(edit, EM_SETSEL, 0, -1);
-            SetFocus(edit);
-            return FALSE; // Fokus wurde selbst gesetzt
-        }
-
-        case WM_COMMAND:
-            switch (cast(int) LOWORD(cast(DWORD) wParam))
-            {
-                case IDOK:
-                {
-                    wchar[256] buf;
-                    int len = GetDlgItemTextW(hDlg, IDC_NAME_EDIT, buf.ptr, cast(int) buf.length);
-                    if (len <= 0)
-                    {
-                        MessageBoxW(hDlg, "Bitte einen Namen eingeben."w.ptr,
-                                    "Hinweis"w.ptr, MB_OK | MB_ICONWARNING);
-                        SetFocus(GetDlgItem(hDlg, IDC_NAME_EDIT));
-                        return TRUE;
-                    }
-                    g_name = buf[0 .. len].idup;
-                    EndDialog(hDlg, IDOK);
-                    return TRUE;
-                }
-
-                case IDCANCEL:
-                    EndDialog(hDlg, IDCANCEL);
-                    return TRUE;
-
-                default:
-                    break;
-            }
-            break;
-
-        default:
-            break;
-    }
-    return FALSE;
-}
-
-/**
- * Baut ein DLGTEMPLATE für den Namensdialog im Speicher auf.
- *
- * Aufbau (siehe Win32-Doku zu DLGTEMPLATE / DLGITEMTEMPLATE):
- *   DLGTEMPLATE, Menü, Klasse, Titel, [Schriftgröße, Schriftname]
- *   je Steuerelement (DWORD-ausgerichtet):
- *   DLGITEMTEMPLATE, Klasse, Text, Erzeugungsdaten
- */
-ushort[] buildNameDialogTemplate() nothrow
-{
-    DialogTemplateBuilder b;
-
-    b.beginDialog(
-        DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU,
-        0, 0, 220, 80,
-        "Name eingeben"w,
-        9, "Segoe UI"w);
-
-    b.addItem(WS_CHILD | WS_VISIBLE | SS_LEFT,
-              10, 10, 200, 10, IDC_NAME_LABEL, ATOM_STATIC, "Bitte geben Sie Ihren Namen ein:"w);
-    b.addItem(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-              10, 24, 200, 14, IDC_NAME_EDIT, ATOM_EDIT, ""w);
-    b.addItem(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-              104, 56, 50, 14, IDOK, ATOM_BUTTON, "OK"w);
-    b.addItem(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-              160, 56, 50, 14, IDCANCEL, ATOM_BUTTON, "Abbrechen"w);
-
-    return b.finish();
-}
-
-enum : ushort
-{
-    ATOM_BUTTON = 0x0080,
-    ATOM_EDIT   = 0x0081,
-    ATOM_STATIC = 0x0082,
-}
-
-/// Hilfsstruktur zum Aufbau eines DLGTEMPLATE in einem WORD-Puffer.
-struct DialogTemplateBuilder
-{
-    private ushort[] buf;
-    private size_t countIndex; // Position des cdit-Feldes
-
-    nothrow:
-
-    private void word(ushort w) { buf ~= w; }
-    private void dword(uint d) { buf ~= cast(ushort)(d & 0xFFFF); buf ~= cast(ushort)(d >> 16); }
-    private void str(wstring s) { foreach (wchar c; s) buf ~= c; buf ~= 0; }
-    private void alignDword() { if (buf.length % 2) buf ~= 0; }
-
-    void beginDialog(uint style, short x, short y, short cx, short cy,
-                     wstring title, ushort pointSize, wstring fontName)
-    {
-        dword(style);
-        dword(0);                 // dwExtendedStyle
-        countIndex = buf.length;
-        word(0);                  // cdit (wird später gesetzt)
-        word(cast(ushort) x);
-        word(cast(ushort) y);
-        word(cast(ushort) cx);
-        word(cast(ushort) cy);
-        word(0);                  // kein Menü
-        word(0);                  // Standard-Dialogklasse
-        str(title);
-        if (style & DS_SETFONT)
-        {
-            word(pointSize);
-            str(fontName);
-        }
-    }
-
-    void addItem(uint style, short x, short y, short cx, short cy,
-                 ushort id, ushort classAtom, wstring text)
-    {
-        alignDword();
-        dword(style);
-        dword(0);                 // dwExtendedStyle
-        word(cast(ushort) x);
-        word(cast(ushort) y);
-        word(cast(ushort) cx);
-        word(cast(ushort) cy);
-        word(id);
-        word(0xFFFF);             // vordefinierte Klasse (Atom)
-        word(classAtom);
-        str(text);
-        word(0);                  // keine Erzeugungsdaten
-        buf[countIndex]++;
-    }
-
-    ushort[] finish() { return buf; }
 }

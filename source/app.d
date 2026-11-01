@@ -19,6 +19,16 @@ import std.algorithm.sorting : sort;
 import std.format : format;
 import std.utf : toUTF16, toUTF16z;
 
+/*
+ * Manifest-Abhängigkeit auf Common Controls 6.0 für das moderne Aussehen
+ * (visuelle Stile). Die Direktive landet in der Objektdatei; der Linker
+ * bettet das erzeugte Manifest dank /MANIFEST:EMBED (siehe dub.json) in die
+ * EXE ein. Entspricht `#pragma comment(linker, ...)` in C/C++.
+ */
+pragma(linkerDirective,
+    "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' " ~
+    "version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"");
+
 // ---------------------------------------------------------------------------
 // IDs
 // ---------------------------------------------------------------------------
@@ -269,17 +279,18 @@ void createChildControls(HWND parent) nothrow
     SendMessageW(g_fileList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
                  LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
 
-    addColumn(0, "Name"w,                360);
-    addColumn(1, "Typ"w,                 90);
-    addColumn(2, "Zuletzt geändert"w,    140);
-    addColumn(3, "Größe (Bytes)"w,       110);
+    addColumn(0, "Name"w,                360, LVCFMT_LEFT);
+    addColumn(1, "Typ"w,                 90,  LVCFMT_LEFT);
+    addColumn(2, "Zuletzt geändert"w,    140, LVCFMT_LEFT);
+    addColumn(3, "Größe (Bytes)"w,       110, LVCFMT_RIGHT); // rechtsbündig
 }
 
-void addColumn(int index, wstring title, int width) nothrow
+void addColumn(int index, wstring title, int width, int align_) nothrow
 {
     wstring text = title ~ "\0"w;
     LVCOLUMNW col;
-    col.mask     = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+    col.mask     = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM | LVCF_FMT;
+    col.fmt      = align_;
     col.cx       = width;
     col.pszText  = cast(LPWSTR) text.ptr;
     col.iSubItem = index;

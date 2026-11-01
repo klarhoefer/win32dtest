@@ -2,6 +2,8 @@
  * Einfache Win32-GUI-Anwendung in D.
  *
  * - Hauptfenster mit Menü (Datei / Hilfe)
+ * - Liste aller Dateien und Verzeichnisse im TMP-Verzeichnis, die zuletzt
+ *   vor der letzten Mitternacht (lokale Zeit) geändert wurden
  * - Modaler Dialog zur Eingabe eines Namens
  *
  * Der Dialog wird zur Laufzeit als DLGTEMPLATE im Speicher aufgebaut,
@@ -12,7 +14,10 @@ module app;
 version (Windows) {} else static assert(0, "Diese Anwendung läuft nur unter Windows.");
 
 import core.sys.windows.windows;
-import std.utf : toUTF16z;
+import core.sys.windows.commctrl;
+import std.algorithm.sorting : sort;
+import std.format : format;
+import std.utf : toUTF16, toUTF16z;
 
 // ---------------------------------------------------------------------------
 // IDs
@@ -23,7 +28,16 @@ enum : UINT
     IDM_FILE_NAME  = 1001,
     IDM_FILE_EXIT  = 1002,
     IDM_HELP_ABOUT = 1003,
+    IDM_FILE_REFRESH = 1004,
 }
+
+enum : UINT
+{
+    IDC_INFO_LABEL = 3001,
+    IDC_FILE_LIST  = 3002,
+}
+
+enum infoHeight = 28; // Höhe der Info-Zeile über der Liste in Pixeln
 
 enum : WORD
 {
@@ -38,6 +52,15 @@ __gshared wstring g_name = "Welt"w;
 
 /// Instanz-Handle der Anwendung.
 __gshared HINSTANCE g_hInstance;
+
+/// Steuerelemente im Hauptfenster.
+__gshared HWND g_infoLabel;
+__gshared HWND g_fileList;
+
+/// Anzahl und Verzeichnis der zuletzt gelisteten Einträge (für die Info-Zeile).
+__gshared size_t g_entryCount;
+__gshared wstring g_tmpDir;
+__gshared wstring g_cutoffText;
 
 // ---------------------------------------------------------------------------
 // Einstiegspunkt
@@ -64,6 +87,11 @@ int main()
 
 int runApp(HINSTANCE hInstance, int nCmdShow)
 {
+    INITCOMMONCONTROLSEX icc;
+    icc.dwSize = INITCOMMONCONTROLSEX.sizeof;
+    icc.dwICC  = ICC_LISTVIEW_CLASSES;
+    InitCommonControlsEx(&icc);
+
     WNDCLASSEXW wc;
     wc.cbSize        = WNDCLASSEXW.sizeof;
     wc.style         = CS_HREDRAW | CS_VREDRAW;
@@ -87,7 +115,7 @@ int runApp(HINSTANCE hInstance, int nCmdShow)
         windowClassName.ptr,
         "Win32 D Testanwendung"w.ptr,
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 640, 400,
+        CW_USEDEFAULT, CW_USEDEFAULT, 800, 500,
         null,
         createMainMenu(),
         hInstance,
@@ -103,9 +131,19 @@ int runApp(HINSTANCE hInstance, int nCmdShow)
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
+    // Tastenkürzel: Strg+N (Name), F5 (Aktualisieren)
+    ACCEL[2] accels = [
+        ACCEL(FVIRTKEY | FCONTROL, 'N', cast(WORD) IDM_FILE_NAME),
+        ACCEL(FVIRTKEY, VK_F5, cast(WORD) IDM_FILE_REFRESH),
+    ];
+    HACCEL hAccel = CreateAcceleratorTableW(accels.ptr, cast(int) accels.length);
+    scope (exit) DestroyAcceleratorTable(hAccel);
+
     MSG msg;
     while (GetMessageW(&msg, null, 0, 0) > 0)
     {
+        if (TranslateAcceleratorW(hwnd, hAccel, &msg))
+            continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -120,6 +158,7 @@ HMENU createMainMenu()
 {
     HMENU fileMenu = CreatePopupMenu();
     AppendMenuW(fileMenu, MF_STRING, IDM_FILE_NAME, "&Name eingeben...\tStrg+N"w.ptr);
+    AppendMenuW(fileMenu, MF_STRING, IDM_FILE_REFRESH, "&Aktualisieren\tF5"w.ptr);
     AppendMenuW(fileMenu, MF_SEPARATOR, 0, null);
     AppendMenuW(fileMenu, MF_STRING, IDM_FILE_EXIT, "&Beenden"w.ptr);
 
@@ -148,13 +187,18 @@ LRESULT mainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) nothrow
                     showNameDialog(hwnd);
                     return 0;
 
+                case IDM_FILE_REFRESH:
+                    refreshFileList();
+                    return 0;
+
                 case IDM_FILE_EXIT:
                     DestroyWindow(hwnd);
                     return 0;
 
                 case IDM_HELP_ABOUT:
                     MessageBoxW(hwnd,
-                        "Win32 D Testanwendung\n\nEin einfaches Beispiel für Fenster, Menü und Dialog in D."w.ptr,
+                        ("Win32 D Testanwendung\n\nEin einfaches Beispiel für Fenster, Menü und Dialog in D.\n"w ~
+                         "Listet Einträge im TMP-Verzeichnis, die vor Mitternacht geändert wurden.\0"w).ptr,
                         "Über"w.ptr, MB_OK | MB_ICONINFORMATION);
                     return 0;
 
@@ -163,35 +207,28 @@ LRESULT mainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) nothrow
             }
             break;
 
-        case WM_KEYDOWN:
-            // Einfaches Tastenkürzel Strg+N für den Namensdialog
-            if (wParam == 'N' && (GetKeyState(VK_CONTROL) & 0x8000))
-            {
-                showNameDialog(hwnd);
-                return 0;
-            }
-            break;
+        case WM_CREATE:
+            createChildControls(hwnd);
+            refreshFileList();
+            return 0;
 
-        case WM_PAINT:
+        case WM_SIZE:
         {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hwnd, &ps);
-
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-
-            HFONT font = cast(HFONT) GetStockObject(DEFAULT_GUI_FONT);
-            HGDIOBJ oldFont = SelectObject(hdc, font);
-            SetBkMode(hdc, TRANSPARENT);
-
-            wstring text = "Hallo, "w ~ g_name ~ "!"w;
-            DrawTextW(hdc, text.ptr, cast(int) text.length, &rc,
-                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-            SelectObject(hdc, oldFont);
-            EndPaint(hwnd, &ps);
+            int w = LOWORD(cast(DWORD) lParam);
+            int h = HIWORD(cast(DWORD) lParam);
+            MoveWindow(g_infoLabel, 8, 6, w - 16, infoHeight - 8, TRUE);
+            MoveWindow(g_fileList, 0, infoHeight, w, h - infoHeight, TRUE);
             return 0;
         }
+
+        case WM_SETFOCUS:
+            SetFocus(g_fileList);
+            return 0;
+
+        case WM_CTLCOLORSTATIC:
+            // Info-Zeile mit dem gleichen Hintergrund wie das Fenster zeichnen
+            SetBkColor(cast(HDC) wParam, GetSysColor(COLOR_WINDOW));
+            return cast(LRESULT) GetSysColorBrush(COLOR_WINDOW);
 
         case WM_DESTROY:
             PostQuitMessage(0);
@@ -201,6 +238,199 @@ LRESULT mainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) nothrow
             break;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// ---------------------------------------------------------------------------
+// Dateiliste (TMP-Verzeichnis)
+// ---------------------------------------------------------------------------
+
+/// Ein Eintrag im TMP-Verzeichnis.
+struct TmpEntry
+{
+    wstring name;
+    bool isDirectory;
+    FILETIME lastWrite; // UTC
+    ulong size;
+}
+
+void createChildControls(HWND parent) nothrow
+{
+    HFONT font = cast(HFONT) GetStockObject(DEFAULT_GUI_FONT);
+
+    g_infoLabel = CreateWindowExW(0, "STATIC"w.ptr, ""w.ptr,
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
+        0, 0, 0, 0, parent, cast(HMENU) cast(size_t) IDC_INFO_LABEL, g_hInstance, null);
+    SendMessageW(g_infoLabel, WM_SETFONT, cast(WPARAM) font, TRUE);
+
+    g_fileList = CreateWindowExW(WS_EX_CLIENTEDGE, "SysListView32"w.ptr, ""w.ptr,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS,
+        0, 0, 0, 0, parent, cast(HMENU) cast(size_t) IDC_FILE_LIST, g_hInstance, null);
+    SendMessageW(g_fileList, WM_SETFONT, cast(WPARAM) font, TRUE);
+    SendMessageW(g_fileList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
+                 LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+
+    addColumn(0, "Name"w,                360);
+    addColumn(1, "Typ"w,                 90);
+    addColumn(2, "Zuletzt geändert"w,    140);
+    addColumn(3, "Größe (Bytes)"w,       110);
+}
+
+void addColumn(int index, wstring title, int width) nothrow
+{
+    wstring text = title ~ "\0"w;
+    LVCOLUMNW col;
+    col.mask     = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+    col.cx       = width;
+    col.pszText  = cast(LPWSTR) text.ptr;
+    col.iSubItem = index;
+    SendMessageW(g_fileList, LVM_INSERTCOLUMNW, cast(WPARAM) index, cast(LPARAM) &col);
+}
+
+void setCell(int row, int column, wstring value) nothrow
+{
+    wstring text = value ~ "\0"w;
+    LVITEMW item;
+    item.mask     = LVIF_TEXT;
+    item.iItem    = row;
+    item.iSubItem = column;
+    item.pszText  = cast(LPWSTR) text.ptr;
+    if (column == 0)
+        SendMessageW(g_fileList, LVM_INSERTITEMW, 0, cast(LPARAM) &item);
+    else
+        SendMessageW(g_fileList, LVM_SETITEMTEXTW, cast(WPARAM) row, cast(LPARAM) &item);
+}
+
+/// Liefert das TMP-Verzeichnis (GetTempPathW wertet TMP, dann TEMP aus).
+wstring tempDirectory() nothrow
+{
+    wchar[MAX_PATH + 1] buf;
+    DWORD len = GetTempPathW(cast(DWORD) buf.length, buf.ptr);
+    if (len == 0 || len > buf.length)
+        return null;
+    return buf[0 .. len].idup;
+}
+
+/// Letzte Mitternacht (00:00 Uhr heute, lokale Zeit) als UTC-FILETIME.
+FILETIME lastMidnightUtc() nothrow
+{
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    st.wHour = 0;
+    st.wMinute = 0;
+    st.wSecond = 0;
+    st.wMilliseconds = 0;
+
+    FILETIME local, utc;
+    SystemTimeToFileTime(&st, &local);
+    LocalFileTimeToFileTime(&local, &utc);
+    return utc;
+}
+
+ulong toUlong(FILETIME ft) nothrow
+{
+    return (cast(ulong) ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+}
+
+/// Formatiert eine UTC-FILETIME als lokale Zeit "TT.MM.JJJJ HH:MM:SS".
+wstring formatFileTime(FILETIME utc)
+{
+    FILETIME local;
+    SYSTEMTIME st;
+    FileTimeToLocalFileTime(&utc, &local);
+    FileTimeToSystemTime(&local, &st);
+    return format("%02d.%02d.%04d %02d:%02d:%02d"w,
+                  st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute, st.wSecond);
+}
+
+/// Sucht alle Dateien und Verzeichnisse in `dir`, die vor `cutoff` geändert wurden.
+TmpEntry[] findEntriesBefore(wstring dir, FILETIME cutoff) nothrow
+{
+    TmpEntry[] result;
+    wstring pattern = dir ~ "*\0"w;
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern.ptr, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return result;
+    scope (exit) FindClose(h);
+
+    do
+    {
+        size_t n = 0;
+        while (n < fd.cFileName.length && fd.cFileName[n] != 0)
+            ++n;
+        wstring name = fd.cFileName[0 .. n].idup;
+        if (name == "."w || name == ".."w)
+            continue;
+
+        if (CompareFileTime(&fd.ftLastWriteTime, &cutoff) < 0)
+        {
+            TmpEntry e;
+            e.name        = name;
+            e.isDirectory = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            e.lastWrite   = fd.ftLastWriteTime;
+            e.size        = (cast(ulong) fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            result ~= e;
+        }
+    }
+    while (FindNextFileW(h, &fd));
+
+    return result;
+}
+
+/// Liest das TMP-Verzeichnis neu ein und füllt die Liste.
+void refreshFileList() nothrow
+{
+    try
+    {
+        g_tmpDir = tempDirectory();
+        if (g_tmpDir.length == 0)
+            throw new Exception("TMP-Verzeichnis konnte nicht ermittelt werden.");
+        FILETIME cutoff = lastMidnightUtc();
+        g_cutoffText = formatFileTime(cutoff);
+
+        auto entries = findEntriesBefore(g_tmpDir, cutoff);
+        // Verzeichnisse zuerst, dann neueste Änderung zuerst
+        entries.sort!((a, b) => a.isDirectory != b.isDirectory
+                                ? a.isDirectory
+                                : toUlong(a.lastWrite) > toUlong(b.lastWrite));
+
+        SendMessageW(g_fileList, WM_SETREDRAW, FALSE, 0);
+        SendMessageW(g_fileList, LVM_DELETEALLITEMS, 0, 0);
+        foreach (i, ref e; entries)
+        {
+            int row = cast(int) i;
+            setCell(row, 0, e.name);
+            setCell(row, 1, e.isDirectory ? "Verzeichnis"w : "Datei"w);
+            setCell(row, 2, formatFileTime(e.lastWrite));
+            setCell(row, 3, e.isDirectory ? ""w : format("%d"w, e.size));
+        }
+        SendMessageW(g_fileList, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g_fileList, null, TRUE);
+
+        g_entryCount = entries.length;
+    }
+    catch (Exception e)
+    {
+        g_entryCount = 0;
+        MessageBoxW(null, ("Fehler beim Lesen des TMP-Verzeichnisses:\n"w ~ e.msg.toUTF16 ~ "\0"w).ptr,
+                    "Fehler"w.ptr, MB_OK | MB_ICONERROR);
+    }
+    updateInfoLabel();
+}
+
+void updateInfoLabel() nothrow
+{
+    try
+    {
+        wstring text = format("Hallo, %s!   %d Einträge in %s, zuletzt geändert vor %s\0"w,
+                              g_name, g_entryCount, g_tmpDir, g_cutoffText);
+        SetWindowTextW(g_infoLabel, text.ptr);
+    }
+    catch (Exception)
+    {
+        SetWindowTextW(g_infoLabel, "Hallo!"w.ptr);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +448,7 @@ void showNameDialog(HWND owner) nothrow
         0);
 
     if (res == IDOK)
-        InvalidateRect(owner, null, TRUE);
+        updateInfoLabel();
 }
 
 extern (Windows)

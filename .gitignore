@@ -1,0 +1,16 @@
+.dub
+docs.json
+__dummy.html
+docs/
+/win32dtest
+win32dtest.so
+win32dtest.dylib
+win32dtest.dll
+win32dtest.a
+win32dtest.lib
+win32dtest-test-*
+*.exe
+*.pdb
+*.o
+*.obj
+*.lst

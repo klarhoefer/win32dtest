@@ -1,0 +1,9 @@
+{
+	"authors": [
+		"Udo"
+	],
+	"copyright": "Copyright © 2026, Udo",
+	"description": "A D Win32 vibe coded App",
+	"license": "proprietary",
+	"name": "win32dtest"
+}

@@ -9,6 +9,6 @@
 	"targetType": "executable",
 	"platforms": ["windows"],
 	"versions": ["Unicode"],
-	"libs-windows": ["user32", "gdi32"],
+	"libs-windows": ["user32", "gdi32", "comctl32"],
 	"lflags-windows": ["/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"]
 }

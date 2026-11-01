@@ -2,8 +2,11 @@
 
 Einfache Win32-GUI-Anwendung in D (nur `core.sys.windows`, keine externen Bibliotheken).
 
-- **Fenster** mit zentriertem Begrüßungstext
-- **Menü**: *Datei → Name eingeben… / Beenden*, *Hilfe → Über…*
+- **Fenster** mit einer Liste (ListView) aller Dateien und Verzeichnisse im
+  TMP-Verzeichnis (`GetTempPathW`), die zuletzt **vor der letzten Mitternacht**
+  (00:00 Uhr heute, lokale Zeit) geändert wurden – Spalten: Name, Typ, Datum, Größe.
+  Darüber eine Info-Zeile mit Begrüßung und Anzahl der Einträge.
+- **Menü**: *Datei → Name eingeben… (Strg+N) / Aktualisieren (F5) / Beenden*, *Hilfe → Über…*
 - **Dialog**: modaler Dialog mit Textfeld, OK und Abbrechen. Das Dialog-Template
   wird zur Laufzeit im Speicher erzeugt (`DialogBoxIndirectParamW`), daher wird
   kein Ressourcen-Compiler benötigt.

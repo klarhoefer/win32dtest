@@ -5,5 +5,10 @@
 	"copyright": "Copyright © 2026, Udo",
 	"description": "A D Win32 vibe coded App",
 	"license": "proprietary",
-	"name": "win32dtest"
+	"name": "win32dtest",
+	"targetType": "executable",
+	"platforms": ["windows"],
+	"versions": ["Unicode"],
+	"libs-windows": ["user32", "gdi32"],
+	"lflags-windows": ["/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"]
 }

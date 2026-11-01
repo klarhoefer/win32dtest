@@ -10,5 +10,5 @@
 	"platforms": ["windows"],
 	"versions": ["Unicode"],
 	"libs-windows": ["user32", "gdi32", "comctl32"],
-	"lflags-windows": ["/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup"]
+	"lflags-windows": ["/SUBSYSTEM:WINDOWS", "/ENTRY:mainCRTStartup", "/MANIFEST:EMBED"]
 }
